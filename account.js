@@ -4,6 +4,7 @@
   var CFG = window.FZ_CONFIG || {};
   var configured = !!(CFG.SUPABASE_URL && CFG.SUPABASE_ANON_KEY && window.supabase);
   var sb = null, session = null, card = null, view = "login", busy = false;
+  var cardChecked = false, claiming = false, rid = 0;
 
   var $q = function (s) { return document.querySelector(s); };
   var say = function (t, ms) { try { toast(t, ms || 2600); } catch (e) {} };
@@ -23,6 +24,7 @@
     ".fzcard .sm{font-size:56px;line-height:1.1;color:var(--rc);text-shadow:0 0 18px var(--rc);margin:6px 0}" +
     ".fzcard .rr{font-size:12px;color:var(--rc);letter-spacing:.2em}.fzcard .nm{font-size:22px;margin:6px 0;text-transform:uppercase}" +
     ".fzcard .ds{font-size:12px;color:var(--sv);line-height:1.6}.fzcard .mt{font-size:11px;color:var(--gr);margin-top:10px;word-break:break-all}" +
+    ".fzcard .gl7{display:block;width:112px;height:112px;margin:8px auto;fill:var(--rc);filter:drop-shadow(0 0 8px var(--rc));shape-rendering:crispEdges}" +
     ".fzcard.COMMON{--rc:#D5D3DB}.fzcard.UNCOMMON{--rc:#5DFFA6}.fzcard.RARE{--rc:#4DA3FF}.fzcard.EPIC{--rc:#A600FF}.fzcard.LEGENDARY{--rc:#FFB020}" +
     ".fzcard.ANOMALY{--rc:#FF2D55;animation:fzan 1.6s infinite}" +
     "@keyframes fzan{0%,92%,100%{transform:none}94%{transform:translateX(-4px) skewX(4deg)}96%{transform:translateX(4px)}98%{transform:translateX(-2px)}}" +
@@ -72,13 +74,14 @@
 
   /* ---------- экраны ---------- */
   function render() {
+    var my = ++rid;
     body.innerHTML = "";
     if (!configured) {
       body.appendChild(el("h3", "", "БАЗА НЕ ПОДКЛЮЧЕНА"));
       body.appendChild(el("p", "", "ВЛАДЕЛЕЦ САЙТА ЕЩЁ НЕ ВСТАВИЛ НАСТРОЙКИ SUPABASE В config.js."));
       return;
     }
-    if (session && view !== "recover") return renderAccount();
+    if (session && view !== "recover") return renderAccount(my);
     if (view === "register") return renderRegister();
     if (view === "forgot") return renderForgot();
     if (view === "recover") return renderRecover();
@@ -166,43 +169,127 @@
     body.appendChild(f);
   }
 
+  /* ---------- уникальный узор карточки: 28 бит -> симметричная сетка 7x7 ---------- */
+  function glyphSvg(g) {
+    var NS = "http://www.w3.org/2000/svg", sv = document.createElementNS(NS, "svg");
+    sv.setAttribute("viewBox", "0 0 7 7"); sv.setAttribute("class", "gl7"); sv.setAttribute("aria-hidden", "true");
+    function cell(x, y) {
+      var r = document.createElementNS(NS, "rect");
+      r.setAttribute("x", x); r.setAttribute("y", y); r.setAttribute("width", 1); r.setAttribute("height", 1);
+      sv.appendChild(r);
+    }
+    for (var y = 0; y < 7; y++) for (var x = 0; x < 4; x++) {
+      if ((g >> (y * 4 + x)) & 1) { cell(x, y); if (x < 3) cell(6 - x, y); }
+    }
+    return sv;
+  }
+
   function cardNode(c) {
     var d = el("div", "fzcard " + c.rarity);
-    d.append(el("div", "rr m", c.rarity), el("div", "sm", c.symbol), el("div", "nm", c.name), el("div", "ds m", c.description));
+    var g = Number(c.glyph) || 0;
+    d.append(el("div", "rr m", c.rarity), glyphSvg(g), el("div", "sm", c.symbol), el("div", "nm", c.name), el("div", "ds m", c.description));
     var dt = new Date(c.acquired_at);
-    d.appendChild(el("div", "mt m", "№ " + c.serial_number + " · ПОЛУЧЕНА " + dt.toLocaleDateString("ru-RU") + " · ВЛАДЕЛЕЦ " + String(c.owner_id).slice(0, 8)));
+    var code = g.toString(16).toUpperCase().padStart(7, "0");
+    d.appendChild(el("div", "mt m", "№ " + c.serial_number + " · ГЕНОМ " + code + " · ПОЛУЧЕНА " + dt.toLocaleDateString("ru-RU") + " · ВЛАДЕЛЕЦ " + String(c.owner_id).slice(0, 8)));
     return d;
   }
 
-  async function renderAccount() {
+  /* ---------- карточка: чтение и выдача ---------- */
+  var CARD_COLS = "serial_number,name,description,symbol,rarity,glyph,acquired_at,owner_id";
+  async function refreshCard() {
+    if (!session) { card = null; cardChecked = false; return; }
+    var cr = await sb.from("cards").select(CARD_COLS).maybeSingle();
+    if (!cr.error) { card = cr.data || null; cardChecked = true; }
+  }
+
+  /* пароль файла, введённый до входа в аккаунт, ждёт в памяти браузера и используется сразу после входа */
+  function setPending(v) { try { if (v) localStorage.setItem("fz_pend", v); else localStorage.removeItem("fz_pend"); } catch (e) {} }
+  function getPending() { try { return localStorage.getItem("fz_pend") || ""; } catch (e) { return ""; } }
+
+  async function claim(pw) {
+    var r = await sb.functions.invoke("claim-card", { method: "POST", body: { password: pw } });
+    if (r.error || !r.data || !r.data.card) {
+      var code = "";
+      try { var j = await r.error.context.json(); code = (j && j.error) || ""; } catch (e) {}
+      return { ok: false, code: code };
+    }
+    card = r.data.card; cardChecked = true;
+    return { ok: true, isNew: !!r.data.is_new };
+  }
+  function failText(code) {
+    if (code === "email_not_confirmed") return "СНАЧАЛА ПОДТВЕРДИ ПОЧТУ (ПИСЬМО), ПОТОМ ВВЕДИ ПАРОЛЬ ЕЩЁ РАЗ.";
+    if (code === "wrong_password") return "СЕРВЕР НЕ ПРИНЯЛ ПАРОЛЬ.";
+    if (code === "unauthorized") return "ВОЙДИ В АККАУНТ И ВВЕДИ ПАРОЛЬ ЕЩЁ РАЗ.";
+    return "НЕ УДАЛОСЬ ПОЛУЧИТЬ КАРТОЧКУ. ВВЕДИ ПАРОЛЬ ЕЩЁ РАЗ.";
+  }
+
+  /* место под карточку прямо в архиве, под окном файла */
+  function put(node) {
+    var tp = $q("#tp"); if (!tp) return;
+    var s = $q("#fzc");
+    if (!s) { s = document.createElement("div"); s.id = "fzc"; s.className = "m"; tp.parentNode.insertBefore(s, tp.nextSibling); }
+    s.innerHTML = ""; if (node) s.appendChild(node);
+  }
+
+  /* вызывается из index.html сразу после ПРАВИЛЬНОГО пароля файла №001 */
+  async function afterPassword(pw) {
+    if (!configured) return;
+    if (!session) {
+      setPending(pw);
+      var b = el("button", "btn", "ВОЙТИ / РЕГИСТРАЦИЯ"); b.type = "button";
+      b.onclick = function () { view = "login"; open(); };
+      var w = document.createElement("div");
+      w.append(el("p", "", "ЧТОБЫ ПОЛУЧИТЬ СВОЮ УНИКАЛЬНУЮ КАРТОЧКУ, ВОЙДИ В АККАУНТ ИЛИ ЗАРЕГИСТРИРУЙСЯ. ФАЙЛ ТЫ УЖЕ ОТКРЫЛ: ПОСЛЕ ВХОДА КАРТОЧКА ВЫДАСТСЯ САМА."), b);
+      put(w); return;
+    }
+    if (claiming) return;
+    claiming = true;
+    try {
+      if (!cardChecked) await refreshCard();
+      var isNew = false;
+      if (!card) {
+        put(el("p", "", "ВЫДАЮ КАРТОЧКУ…"));
+        var r = await claim(pw);
+        if (!r.ok) {
+          if (r.code === "wrong_password") setPending(null);
+          put(el("p", "err", failText(r.code))); return;
+        }
+        isNew = r.isNew;
+        try { flash(); } catch (e) {}
+      }
+      setPending(null);
+      say(isNew ? "КАРТОЧКА ПОЛУЧЕНА." : "ЭТО УЖЕ ТВОЯ КАРТОЧКА.", 3200);
+      put(cardNode(card));
+      if (box.classList.contains("on")) { view = "login"; render(); }
+    } finally { claiming = false; }
+  }
+
+  async function renderAccount(my) {
     var u = session.user;
     body.appendChild(el("h3", "", "ЛИЧНЫЙ АККАУНТ"));
-    var info = el("p", "", "ПОЧТА: " + u.email); body.appendChild(info);
+    body.appendChild(el("p", "", "ПОЧТА: " + u.email));
     var nickP = el("p", "", "НИКНЕЙМ: …"); body.appendChild(nickP);
     var holder = el("div", ""); body.appendChild(holder);
     var er = el("div", "err", ""); er.id = "accm"; body.appendChild(er);
+    var out = el("button", "tg m", "ВЫЙТИ");
+    out.onclick = async function () { setPending(null); await sb.auth.signOut(); card = null; cardChecked = false; view = "login"; render(); say("СЕАНС ЗАВЕРШЁН."); };
+    body.appendChild(out);
 
-    var out = el("button", "tg m", "ВЫЙТИ"); out.onclick = async function () { await sb.auth.signOut(); card = null; view = "login"; render(); say("СЕАНС ЗАВЕРШЁН."); };
     var pr = await sb.from("profiles").select("nickname").eq("id", u.id).maybeSingle();
+    if (my !== rid) return;
     if (pr.data) nickP.textContent = "НИКНЕЙМ: " + pr.data.nickname;
 
-    var cr = await sb.from("cards").select("serial_number,name,description,symbol,rarity,acquired_at,owner_id").maybeSingle();
-    if (cr.data) card = cr.data;
+    await refreshCard();
+    if (my !== rid) return;
     if (card) holder.appendChild(cardNode(card));
-    else {
-      var get = el("button", "btn", "ПОЛУЧИТЬ КАРТОЧКУ");
-      get.onclick = async function () {
-        if (busy) return; lock(get, true); msg("");
-        var r = await sb.functions.invoke("claim-card", { method: "POST" });
-        lock(get, false);
-        if (r.error || !r.data || !r.data.card) return msg("НЕ УДАЛОСЬ ПОЛУЧИТЬ КАРТОЧКУ. ПОПРОБУЙ ПОЗЖЕ.");
-        card = r.data.card; holder.innerHTML = ""; holder.appendChild(cardNode(card));
-        try { flash(); } catch (e) {} say(r.data.is_new ? "КАРТОЧКА ПОЛУЧЕНА." : "ЭТО УЖЕ ТВОЯ КАРТОЧКА.");
-      };
-      holder.append(el("p", "", "У ТЕБЯ ПОКА НЕТ КАРТОЧКИ. ОНА МОЖЕТ БЫТЬ ТОЛЬКО ОДНА."), get);
-    }
-    body.appendChild(out);
+    else holder.appendChild(el("p", "", "КАРТОЧКИ ПОКА НЕТ. ЕЁ ВЫДАЮТ ЗА ОТКРЫТИЕ ЗАКРЫТОГО ФАЙЛА №001 В АРХИВЕ: НАЙДИ ПАРОЛЬ И ВВЕДИ ЕГО, ПОКА ТЫ ВОШЁЛ В АККАУНТ. У КАЖДОГО ИГРОКА СВОЯ, НЕПОВТОРИМАЯ КАРТОЧКА."));
   }
+
+  /* маленький мост для основного скрипта сайта */
+  window.FZ = {
+    afterPassword: function (pw) { return afterPassword(pw); },
+    wantsCard: function () { return !!(configured && session && cardChecked && !card); }
+  };
 
   /* ---------- запуск ---------- */
   function setBtn() { btn.textContent = session ? "АККАУНТ" : "ВХОД"; }
@@ -213,12 +300,17 @@
   });
 
   sb.auth.onAuthStateChange(function (ev, s) {
-    session = s; if (!s) card = null;
+    session = s; if (!s) { card = null; cardChecked = false; }
     setBtn();
     /* не вызываем запросы Supabase прямо внутри обработчика, поэтому setTimeout */
-    setTimeout(function () {
-      if (ev === "PASSWORD_RECOVERY") { view = "recover"; open(); }
-      else if (box.classList.contains("on") && (ev === "SIGNED_IN" || ev === "SIGNED_OUT")) { if (ev === "SIGNED_IN") view = "login"; render(); }
+    setTimeout(async function () {
+      if (ev === "PASSWORD_RECOVERY") { view = "recover"; open(); return; }
+      if (ev === "SIGNED_IN" && s) {
+        await refreshCard();
+        var p = getPending();
+        if (p) { afterPassword(p); return; }   /* пароль файла ждал входа: выдаём карточку */
+      }
+      if (box.classList.contains("on") && (ev === "SIGNED_IN" || ev === "SIGNED_OUT")) { if (ev === "SIGNED_IN") view = "login"; render(); }
     }, 0);
   });
 
@@ -234,5 +326,8 @@
     }
   })();
 
-  sb.auth.getSession().then(function (r) { session = r.data.session; setBtn(); });
+  sb.auth.getSession().then(function (r) {
+    session = r.data.session; setBtn();
+    return refreshCard().then(function () { var p = getPending(); if (session && p) afterPassword(p); });
+  });
 })();

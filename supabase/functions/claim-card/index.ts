@@ -1,11 +1,17 @@
 // FIZZAROLLIO · серверная функция выдачи карточки.
-// 1) проверяет, что пользователь вошёл (по его токену),
-// 2) вызывает SQL-функцию issue_card с серверным ключом,
-// 3) возвращает карточку. Повторный вызов вернёт ту же карточку.
+// 1) проверяет, что пользователь вошёл (по его токену) и почта подтверждена,
+// 2) проверяет ПАРОЛЬ ФАЙЛА №001 на сервере (карточку нельзя получить без него),
+// 3) вызывает SQL-функцию issue_card с серверным ключом,
+// 4) возвращает карточку. Повторный вызов вернёт ту же самую карточку.
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
 
 // Разрешённые адреса сайта. Задаётся секретом ALLOWED_ORIGIN (см. инструкцию).
 const allowed = (Deno.env.get("ALLOWED_ORIGIN") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+
+// Пароль файла. Должен совпадать с паролем в index.html (ARCH.pass).
+// Хочешь другой — задай секрет FILE_PASSWORD. Если секрета нет, используется «СЛЕД».
+const norm = (s: string) => s.trim().toUpperCase().replace(/Ё/g, "Е");
+const FILE_PASSWORD = norm(Deno.env.get("FILE_PASSWORD") ?? "СЛЕД");
 
 function corsHeaders(origin: string | null): Record<string, string> {
   const ok = origin && allowed.includes(origin) ? origin : (allowed[0] ?? "null");
@@ -41,7 +47,15 @@ Deno.serve(async (req) => {
   // Почта должна быть подтверждена
   if (!user.email_confirmed_at) return json({ error: "email_not_confirmed" }, 403);
 
-  // Берём ТОЛЬКО id из проверенного токена, ничего из тела запроса
+  // Пароль файла: из тела запроса берём только его, и только для сравнения
+  let pass = "";
+  try {
+    const body = await req.json();
+    if (typeof body?.password === "string") pass = norm(body.password.slice(0, 64));
+  } catch { /* тела нет */ }
+  if (pass !== FILE_PASSWORD) return json({ error: "wrong_password" }, 403);
+
+  // Берём ТОЛЬКО id из проверенного токена
   const { data, error } = await admin.rpc("issue_card", { p_user_id: user.id });
   if (error || !data || data.length === 0) {
     console.error("issue_card failed", error?.message);
@@ -51,7 +65,7 @@ Deno.serve(async (req) => {
   return json({
     card: {
       serial_number: c.serial_number, name: c.name, description: c.description,
-      symbol: c.symbol, rarity: c.rarity, acquired_at: c.acquired_at, owner_id: user.id,
+      symbol: c.symbol, rarity: c.rarity, glyph: c.glyph, acquired_at: c.acquired_at, owner_id: user.id,
     },
     is_new: c.is_new,
   });
