@@ -1,0 +1,10 @@
+# секреты и служебные файлы: никогда не коммитить
+.env
+.env.*
+*.pem
+*.key
+supabase/.temp/
+.supabase/
+service_role*
+node_modules/
+.DS_Store
